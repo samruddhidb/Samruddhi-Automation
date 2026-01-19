@@ -1,10 +1,18 @@
+<<<<<<< HEAD
 name: Daily NAV Update
+=======
+﻿name: Daily NAV Update
+>>>>>>> f09b186 (Setup deployment and fixed syntax)
 
 on:
   schedule:
     # Runs at 18:25 UTC = 11:55 PM IST (Mon-Fri)
     - cron: '25 18 * * 1-5'
+<<<<<<< HEAD
   workflow_dispatch: # Allows you to click a button to test it
+=======
+  workflow_dispatch: # Allows you to run it manually button click for testing
+>>>>>>> f09b186 (Setup deployment and fixed syntax)
 
 jobs:
   update-nav:
@@ -27,4 +35,8 @@ jobs:
       env:
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+<<<<<<< HEAD
       run: python daily_nav.py
+=======
+      run: python daily_nav.py
+>>>>>>> f09b186 (Setup deployment and fixed syntax)
