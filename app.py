@@ -30,7 +30,7 @@ def clean_float(val):
     except:
         return 0.0
 
-# --- 🧠 LOGIC: FILE PARSER (Extracts Raw Data) ---
+# --- 🧠 LOGIC: FILE PARSER ---
 def process_rta_files(uploaded_files, passwords):
     all_data = []
     pwd_list = [p.strip() for p in passwords.split(",")] if passwords else [None]
@@ -61,7 +61,6 @@ def process_rta_files(uploaded_files, passwords):
 
             # 2. Extract Data
             if df is not None:
-                # Normalize headers
                 df.columns = [str(c).strip().replace("'", "").replace('"', "") for c in df.columns]
                 fname = uploaded_file.name.upper()
                 is_r9 = "R9" in fname or "IDENTITY" in fname
@@ -74,7 +73,6 @@ def process_rta_files(uploaded_files, passwords):
                          'scheme': None, 'units': 0.0, 'action': None, 'source_row': idx + 2}
                     
                     try:
-                        # Parsing Logic...
                         if is_r9:
                             row_text = " ".join([str(v) for v in row.values])
                             pan_match = re.search(r"([A-Z]{5}[0-9]{4}[A-Z]{1})", row_text)
@@ -107,6 +105,7 @@ def process_rta_files(uploaded_files, passwords):
                             if any(x in nature for x in ['PURCHASE', 'S T P IN', 'SWITCH IN']): t['action'] = 'ADD'
                             elif any(x in nature for x in ['SHIFT OUT', 'REDEMPTION', 'SWITCH OUT']): t['action'] = 'DEDUCT'
 
+                        # Allow row if it has EITHER Name OR PAN (We will fix missing PANs later)
                         if t['name'] or t['pan']: all_data.append(t)
                     except: continue
 
@@ -114,54 +113,60 @@ def process_rta_files(uploaded_files, passwords):
 
     return all_data
 
-# --- 💾 LOGIC: SMART AGGREGATION & SYNC ---
+# --- 💾 LOGIC: SMART SYNC WITH NAME LOOKUP ---
 def sync_to_db(data):
     if not data: return 0, ["No data found"]
     
-    # Convert list to DataFrame for smart calculation
+    # 1. FETCH KNOWN CLIENTS (Build the Brain)
+    # We fetch all existing clients to map Name -> PAN
+    try:
+        db_clients = supabase.table('clients').select('name, pan').execute()
+        # Create a dictionary: {'JOHN DOE': 'ABCDE1234F', ...}
+        name_map = {item['name'].strip().upper(): item['pan'] for item in db_clients.data if item['name'] and item['pan']}
+    except Exception as e:
+        name_map = {} # Fallback if DB fetch fails
+        print(f"Lookup Warning: {e}")
+
     df = pd.DataFrame(data)
     errors = []
     
-    # 1. SYNC CLIENTS (Name, Email, Pan) - Row by Row is fine here
-    # We filter only unique PANs to save DB calls
+    # 2. FILL MISSING PANS
+    # If PAN is missing but Name matches our DB, fill it in!
+    def fill_pan(row):
+        if not row['pan'] and row['name']:
+            clean_name = str(row['name']).strip().upper()
+            return name_map.get(clean_name, None) # Returns PAN if found, else None
+        return row['pan']
+
+    df['pan'] = df.apply(fill_pan, axis=1)
+
+    # 3. SYNC NEW CLIENTS (Only if PAN exists)
     unique_clients = df[['pan', 'name', 'email', 'phone']].drop_duplicates(subset=['pan'])
-    
     for _, row in unique_clients.iterrows():
         if row['pan'] and row['name']:
             payload = {k: v for k, v in row.to_dict().items() if v and k in ['pan', 'name', 'email', 'phone']}
             try:
                 supabase.table('clients').upsert(payload).execute()
             except Exception as e:
-                errors.append(f"Client Sync Error {row['pan']}: {e}")
+                errors.append(f"Client Error {row['pan']}: {e}")
 
-    # 2. SYNC STAGING (Log everything)
-    # Just insert the raw data so we have a record
+    # 4. SYNC STAGING (Log All)
     try:
-        # Prepare data for staging table (ensure columns match DB)
         staging_data = df[['pan', 'name', 'email', 'phone', 'scheme', 'units', 'action']].where(pd.notnull(df), None).to_dict('records')
-        # Batch insert is faster
         for i in range(0, len(staging_data), 100):
-            batch = staging_data[i:i+100]
-            supabase.table('staging_clients').insert(batch).execute()
+            supabase.table('staging_clients').insert(staging_data[i:i+100]).execute()
     except Exception as e:
         errors.append(f"Staging Error: {e}")
 
-    # 3. SYNC PORTFOLIO (The Hard Math)
-    # Filter for rows that have scheme info
+    # 5. SYNC PORTFOLIO (Only works if we found a PAN)
     portfolio_df = df[df['scheme'].notna() & df['pan'].notna()].copy()
     
     if not portfolio_df.empty:
-        # A. Calculate Net Movement for this batch in Python
-        # If Action is DEDUCT, make units negative
         portfolio_df['signed_units'] = portfolio_df.apply(
             lambda x: -x['units'] if x['action'] == 'DEDUCT' else x['units'], axis=1
         )
-        
-        # B. Group by PAN + SCHEME and Sum them up
-        # This handles "multiple transactions for same name+pan combination at once"
         aggregated = portfolio_df.groupby(['pan', 'scheme'])['signed_units'].sum().reset_index()
         
-        # C. Update DB
         progress = st.progress(0)
         total_groups = len(aggregated)
         
@@ -171,27 +176,17 @@ def sync_to_db(data):
             net_change = row['signed_units']
             
             try:
-                # Fetch current balance
                 res = supabase.table('portfolio_snapshot').select('total_units')\
                     .eq('pan', pan).eq('scheme_name', scheme).execute()
+                current = float(res.data[0]['total_units']) if res.data else 0.0
                 
-                current_db_units = float(res.data[0]['total_units']) if res.data else 0.0
-                
-                # Calculate final
-                final_units = current_db_units + net_change
-                
-                # Upsert
                 supabase.table('portfolio_snapshot').upsert({
-                    'pan': pan,
-                    'scheme_name': scheme,
-                    'total_units': round(final_units, 4)
+                    'pan': pan, 'scheme_name': scheme, 'total_units': round(current + net_change, 4)
                 }, on_conflict='pan,scheme_name').execute()
-                
             except Exception as e:
-                errors.append(f"Portfolio Error {pan} - {scheme}: {e}")
+                errors.append(f"Portfolio Error {pan}: {e}")
             
-            if i % 5 == 0: progress.progress((i + 1) / total_groups)
-        
+            if i % 10 == 0: progress.progress((i + 1) / total_groups)
         progress.empty()
 
     return len(data), errors
@@ -203,15 +198,13 @@ pwd_input = st.text_input("Zip Passwords", type="password")
 
 if st.button("🚀 Process & Sync"):
     if files:
-        with st.spinner("Processing & Calculating..."):
+        with st.spinner("Processing..."):
             results = process_rta_files(files, pwd_input)
-            
-            if not results:
-                st.warning("No valid data found in files.")
-            else:
+            if results:
                 s, err_list = sync_to_db(results)
                 st.success(f"✅ Processed {s} transactions!")
-                
                 if err_list:
                     with st.expander("⚠️ View Errors"):
                         for e in err_list: st.write(e)
+            else:
+                st.warning("No data found.")
