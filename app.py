@@ -30,11 +30,9 @@ def clean_float(val):
     except:
         return 0.0
 
-# --- 🧠 LOGIC: ROBUST PARSER WITH MULTI-PASSWORD ---
+# --- 🧠 LOGIC: FILE PARSER (Extracts Raw Data) ---
 def process_rta_files(uploaded_files, passwords):
     all_data = []
-    
-    # Ensure passwords is a list
     pwd_list = [p.strip() for p in passwords.split(",")] if passwords else [None]
 
     for uploaded_file in uploaded_files:
@@ -42,9 +40,8 @@ def process_rta_files(uploaded_files, passwords):
         success_read = False
         
         try:
-            # 1. Handle ZIP Files with Multi-Password Try
+            # 1. Handle ZIP / CSV
             if uploaded_file.name.endswith('.zip'):
-                # Try every password in the list
                 for pwd in pwd_list:
                     try:
                         with pyzipper.AESZipFile(uploaded_file) as z:
@@ -54,35 +51,30 @@ def process_rta_files(uploaded_files, passwords):
                             with z.open(target) as f:
                                 df = pd.read_csv(io.TextIOWrapper(f, encoding='utf-8'), on_bad_lines='skip', low_memory=False)
                                 success_read = True
-                                break # Stop trying passwords if one works
-                    except RuntimeError:
-                        continue # Wrong password, try next
-                
+                                break 
+                    except RuntimeError: continue
                 if not success_read:
                     st.warning(f"🔒 Could not open {uploaded_file.name}. Check passwords.")
                     continue
-
-            # 2. Handle CSV Files
             else:
                 df = pd.read_csv(uploaded_file, on_bad_lines='skip', low_memory=False)
 
-            # --- PARSING LOGIC ---
+            # 2. Extract Data
             if df is not None:
-                # Clean headers
+                # Normalize headers
                 df.columns = [str(c).strip().replace("'", "").replace('"', "") for c in df.columns]
-                
                 fname = uploaded_file.name.upper()
-                is_r9 = "R9" in fname
-                is_r33 = "R33" in fname
+                is_r9 = "R9" in fname or "IDENTITY" in fname
+                is_r33 = "R33" in fname or "TRXN" in fname
                 is_kfin_m = fname.startswith("MFSD211")
                 is_kfin_t = fname.startswith("MFSD201")
 
                 for idx, row in df.iterrows():
-                    # Default dictionary with all possible fields
                     t = {'pan': None, 'name': None, 'email': None, 'phone': None, 
                          'scheme': None, 'units': 0.0, 'action': None, 'source_row': idx + 2}
                     
                     try:
+                        # Parsing Logic...
                         if is_r9:
                             row_text = " ".join([str(v) for v in row.values])
                             pan_match = re.search(r"([A-Z]{5}[0-9]{4}[A-Z]{1})", row_text)
@@ -96,7 +88,7 @@ def process_rta_files(uploaded_files, passwords):
                             t['name'] = clean_str(row.get('INVNAME'))
                             t['units'] = clean_float(row.get('UNITS'))
                             nature = clean_str(row.get('TRXN_TYPE_FLAG') or "").upper()
-                            if any(x in nature for x in ['PURCHASE', 'SYSTEMATIC', 'SWITCH IN']): t['action'] = 'ADD'
+                            if any(x in nature for x in ['PURCHASE', 'SYSTEMATIC', 'SWITCH IN', 'REINVESTMENT']): t['action'] = 'ADD'
                             elif any(x in nature for x in ['REDEMPTION', 'TRANSFER', 'SWITCH OUT']): t['action'] = 'DEDUCT'
 
                         elif is_kfin_m:
@@ -115,93 +107,111 @@ def process_rta_files(uploaded_files, passwords):
                             if any(x in nature for x in ['PURCHASE', 'S T P IN', 'SWITCH IN']): t['action'] = 'ADD'
                             elif any(x in nature for x in ['SHIFT OUT', 'REDEMPTION', 'SWITCH OUT']): t['action'] = 'DEDUCT'
 
-                        if t['name'] or t['pan']: 
-                            all_data.append(t)
-                            
-                    except Exception:
-                        continue
+                        if t['name'] or t['pan']: all_data.append(t)
+                    except: continue
 
-        except Exception as e:
-            st.error(f"⚠️ Error reading {uploaded_file.name}: {e}")
+        except Exception as e: st.error(f"Error reading {uploaded_file.name}: {e}")
 
     return all_data
 
-# --- 💾 LOGIC: SYNC WITH STRICT COLUMN FILTERING ---
+# --- 💾 LOGIC: SMART AGGREGATION & SYNC ---
 def sync_to_db(data):
-    success_count = 0
+    if not data: return 0, ["No data found"]
+    
+    # Convert list to DataFrame for smart calculation
+    df = pd.DataFrame(data)
     errors = []
     
-    status_bar = st.progress(0)
-    total = len(data)
-
-    for i, item in enumerate(data):
-        try:
-            # FIX: Create a strict payload for Clients Table (Name/Pan/Email/Phone ONLY)
-            client_payload = {
-                'pan': item.get('pan'),
-                'name': item.get('name'),
-                'email': item.get('email'),
-                'phone': item.get('phone')
-            }
-            # Remove empty keys so we don't overwrite DB data with None
-            client_payload = {k: v for k, v in client_payload.items() if v is not None}
-
-            # 1. Update Clients Tables
-            if item.get('pan') and item.get('name'):
-                supabase.table('clients').upsert(client_payload).execute()
-            elif item.get('pan') or item.get('name'):
-                # This fixes the "Could not find column" error by only sending client_payload
-                supabase.table('staging_clients').insert(client_payload).execute()
-
-            # 2. Update Portfolio Snapshot (Only if we have Scheme + Units)
-            if item.get('scheme') and item.get('units', 0) > 0 and item.get('pan'):
-                res = supabase.table('portfolio_snapshot').select('total_units')\
-                    .eq('pan', item['pan']).eq('scheme_name', item['scheme']).execute()
-                
-                old_units = float(res.data[0]['total_units']) if res.data else 0.0
-                current_units = item['units']
-                
-                if item.get('action') == 'ADD':
-                    new_units = old_units + current_units
-                elif item.get('action') == 'DEDUCT':
-                    new_units = old_units - current_units
-                else:
-                    new_units = old_units # No action, assume snapshot?
-
-                supabase.table('portfolio_snapshot').upsert({
-                    'pan': item['pan'], 
-                    'scheme_name': item['scheme'], 
-                    'total_units': round(new_units, 4)
-                }, on_conflict='pan,scheme_name').execute()
-            
-            success_count += 1
-            
-        except Exception as e:
-            # Capture the exact error for the user
-            errors.append(f"Row {item.get('source_row')}: {str(e)}")
-        
-        if i % 10 == 0: status_bar.progress((i + 1) / total)
+    # 1. SYNC CLIENTS (Name, Email, Pan) - Row by Row is fine here
+    # We filter only unique PANs to save DB calls
+    unique_clients = df[['pan', 'name', 'email', 'phone']].drop_duplicates(subset=['pan'])
     
-    status_bar.empty()
-    return success_count, errors
+    for _, row in unique_clients.iterrows():
+        if row['pan'] and row['name']:
+            payload = {k: v for k, v in row.to_dict().items() if v and k in ['pan', 'name', 'email', 'phone']}
+            try:
+                supabase.table('clients').upsert(payload).execute()
+            except Exception as e:
+                errors.append(f"Client Sync Error {row['pan']}: {e}")
+
+    # 2. SYNC STAGING (Log everything)
+    # Just insert the raw data so we have a record
+    try:
+        # Prepare data for staging table (ensure columns match DB)
+        staging_data = df[['pan', 'name', 'email', 'phone', 'scheme', 'units', 'action']].where(pd.notnull(df), None).to_dict('records')
+        # Batch insert is faster
+        for i in range(0, len(staging_data), 100):
+            batch = staging_data[i:i+100]
+            supabase.table('staging_clients').insert(batch).execute()
+    except Exception as e:
+        errors.append(f"Staging Error: {e}")
+
+    # 3. SYNC PORTFOLIO (The Hard Math)
+    # Filter for rows that have scheme info
+    portfolio_df = df[df['scheme'].notna() & df['pan'].notna()].copy()
+    
+    if not portfolio_df.empty:
+        # A. Calculate Net Movement for this batch in Python
+        # If Action is DEDUCT, make units negative
+        portfolio_df['signed_units'] = portfolio_df.apply(
+            lambda x: -x['units'] if x['action'] == 'DEDUCT' else x['units'], axis=1
+        )
+        
+        # B. Group by PAN + SCHEME and Sum them up
+        # This handles "multiple transactions for same name+pan combination at once"
+        aggregated = portfolio_df.groupby(['pan', 'scheme'])['signed_units'].sum().reset_index()
+        
+        # C. Update DB
+        progress = st.progress(0)
+        total_groups = len(aggregated)
+        
+        for i, (idx, row) in enumerate(aggregated.iterrows()):
+            pan = row['pan']
+            scheme = row['scheme']
+            net_change = row['signed_units']
+            
+            try:
+                # Fetch current balance
+                res = supabase.table('portfolio_snapshot').select('total_units')\
+                    .eq('pan', pan).eq('scheme_name', scheme).execute()
+                
+                current_db_units = float(res.data[0]['total_units']) if res.data else 0.0
+                
+                # Calculate final
+                final_units = current_db_units + net_change
+                
+                # Upsert
+                supabase.table('portfolio_snapshot').upsert({
+                    'pan': pan,
+                    'scheme_name': scheme,
+                    'total_units': round(final_units, 4)
+                }, on_conflict='pan,scheme_name').execute()
+                
+            except Exception as e:
+                errors.append(f"Portfolio Error {pan} - {scheme}: {e}")
+            
+            if i % 5 == 0: progress.progress((i + 1) / total_groups)
+        
+        progress.empty()
+
+    return len(data), errors
 
 # --- 🖥️ UI ---
 st.write("### 📤 Upload RTA Zip/CSV Files")
 files = st.file_uploader("Select multiple files", type=['zip', 'csv'], accept_multiple_files=True)
-pwd_input = st.text_input("Zip Passwords (separated by comma)", type="password", help="Enter all possible passwords: e.g. PAN123, PASS456")
+pwd_input = st.text_input("Zip Passwords", type="password")
 
 if st.button("🚀 Process & Sync"):
     if files:
-        with st.spinner("Processing files..."):
+        with st.spinner("Processing & Calculating..."):
             results = process_rta_files(files, pwd_input)
-            st.write(f"📂 Extracted {len(results)} valid rows. Syncing...")
             
-            s, err_list = sync_to_db(results)
-            
-            if s > 0: st.success(f"✅ Successfully synced {s} records!")
-            
-            if len(err_list) > 0:
-                with st.expander(f"⚠️ {len(err_list)} records failed (Click to view details)"):
-                    for err in err_list[:20]: # Show first 20 errors
-                        st.write(err)
-                    if len(err_list) > 20: st.write(f"...and {len(err_list)-20} more.")
+            if not results:
+                st.warning("No valid data found in files.")
+            else:
+                s, err_list = sync_to_db(results)
+                st.success(f"✅ Processed {s} transactions!")
+                
+                if err_list:
+                    with st.expander("⚠️ View Errors"):
+                        for e in err_list: st.write(e)

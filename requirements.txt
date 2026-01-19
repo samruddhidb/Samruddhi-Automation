@@ -1,5 +1,4 @@
-﻿streamlit
+streamlit
 pandas
-requests
 pyzipper
 supabase
