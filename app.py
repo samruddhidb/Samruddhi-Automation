@@ -30,15 +30,40 @@ def clean_float(val):
     except:
         return 0.0
 
-# --- 🧠 LOGIC: FILE PARSER ---
+def fetch_latest_navs(schemes):
+    """
+    Mock function to fetch NAVs. 
+    In production, replace this with an API call (e.g., MFAPI.in)
+    For now, we just check if we have a stored NAV in 'watched_schemes' or default to 10.0
+    """
+    nav_map = {}
+    try:
+        # Optimziation: Fetch only needed schemes if possible, or all watched
+        response = supabase.table('watched_schemes').select('scheme_name, nav').execute()
+        for item in response.data:
+            nav_map[item['scheme_name']] = float(item['nav'])
+    except:
+        pass # specific error handling if needed
+    return nav_map
+
+# --- 🧠 LOGIC: FILE PARSER (Robust & Smart) ---
 def process_rta_files(uploaded_files, passwords):
     all_data = []
     pwd_list = [p.strip() for p in passwords.split(",")] if passwords else [None]
+    is_lifetime_reset = False
 
     for uploaded_file in uploaded_files:
         df = None
         success_read = False
         
+        # FAIL-SAFE CHECK: Is this a "Lifetime" April 2024 file?
+        # We check the filename or content date if possible. 
+        # For now, simple filename check or user flag is safest.
+        # Logic: If filename contains 'APR2024' or similar, trigger reset.
+        if "APR2024" in uploaded_file.name.upper() or "LIFETIME" in uploaded_file.name.upper():
+            is_lifetime_reset = True
+            st.toast(f"⚠️ LIFETIME RESET DETECTED in {uploaded_file.name}!", icon="🔥")
+
         try:
             # 1. Handle ZIP / CSV
             if uploaded_file.name.endswith('.zip'):
@@ -105,70 +130,80 @@ def process_rta_files(uploaded_files, passwords):
                             if any(x in nature for x in ['PURCHASE', 'S T P IN', 'SWITCH IN']): t['action'] = 'ADD'
                             elif any(x in nature for x in ['SHIFT OUT', 'REDEMPTION', 'SWITCH OUT']): t['action'] = 'DEDUCT'
 
-                        # Allow row if it has EITHER Name OR PAN (We will fix missing PANs later)
+                        # Store valid rows
                         if t['name'] or t['pan']: all_data.append(t)
                     except: continue
 
         except Exception as e: st.error(f"Error reading {uploaded_file.name}: {e}")
 
-    return all_data
+    return all_data, is_lifetime_reset
 
-# --- 💾 LOGIC: SMART SYNC WITH NAME LOOKUP ---
-def sync_to_db(data):
+# --- 💾 LOGIC: THE INTELLIGENT SYNC ENGINE ---
+def sync_to_db(data, is_reset_mode):
     if not data: return 0, ["No data found"]
     
-    # 1. FETCH KNOWN CLIENTS (Build the Brain)
-    # We fetch all existing clients to map Name -> PAN
-    try:
-        db_clients = supabase.table('clients').select('name, pan').execute()
-        # Create a dictionary: {'JOHN DOE': 'ABCDE1234F', ...}
-        name_map = {item['name'].strip().upper(): item['pan'] for item in db_clients.data if item['name'] and item['pan']}
-    except Exception as e:
-        name_map = {} # Fallback if DB fetch fails
-        print(f"Lookup Warning: {e}")
-
-    df = pd.DataFrame(data)
     errors = []
     
-    # 2. FILL MISSING PANS
-    # If PAN is missing but Name matches our DB, fill it in!
+    # 1. BRAIN BUILD: Fetch Name->PAN Map from DB
+    try:
+        db_clients = supabase.table('clients').select('name, pan').execute()
+        name_map = {item['name'].strip().upper(): item['pan'] for item in db_clients.data if item['name'] and item['pan']}
+    except: name_map = {}
+
+    # 2. NAV BUILD: Fetch latest NAVs
+    nav_map = fetch_latest_navs(set([d['scheme'] for d in data if d.get('scheme')]))
+
+    df = pd.DataFrame(data)
+
+    # 3. SELF-HEALING: Fill missing PANs
     def fill_pan(row):
         if not row['pan'] and row['name']:
-            clean_name = str(row['name']).strip().upper()
-            return name_map.get(clean_name, None) # Returns PAN if found, else None
+            return name_map.get(str(row['name']).strip().upper(), None)
         return row['pan']
-
     df['pan'] = df.apply(fill_pan, axis=1)
 
-    # 3. SYNC NEW CLIENTS (Only if PAN exists)
+    # 4. FAIL-SAFE RESET (The "April 2024" Logic)
+    if is_reset_mode:
+        # Logic: If this is a lifetime file, we assume the units in this file 
+        # are the TOTAL holdings. We should overwrite, not add.
+        # For safety, we delete portfolio entries for the PANs found in this file.
+        unique_reset_pans = df[df['pan'].notna()]['pan'].unique()
+        if len(unique_reset_pans) > 0:
+            try:
+                # Batch delete is safer
+                supabase.table('portfolio_snapshot').delete().in_('pan', list(unique_reset_pans)).execute()
+                errors.append(f"⚠️ RESET TRIGGERED: Cleared portfolio for {len(unique_reset_pans)} clients.")
+            except Exception as e:
+                errors.append(f"Reset Failed: {e}")
+
+    # 5. SYNC CLIENTS (Master Data)
     unique_clients = df[['pan', 'name', 'email', 'phone']].drop_duplicates(subset=['pan'])
     for _, row in unique_clients.iterrows():
         if row['pan'] and row['name']:
             payload = {k: v for k, v in row.to_dict().items() if v and k in ['pan', 'name', 'email', 'phone']}
-            try:
-                supabase.table('clients').upsert(payload).execute()
-            except Exception as e:
-                errors.append(f"Client Error {row['pan']}: {e}")
+            try: supabase.table('clients').upsert(payload).execute()
+            except: pass
 
-    # 4. SYNC STAGING (Log All)
+    # 6. SYNC STAGING (Raw Log - Always Insert)
     try:
         staging_data = df[['pan', 'name', 'email', 'phone', 'scheme', 'units', 'action']].where(pd.notnull(df), None).to_dict('records')
         for i in range(0, len(staging_data), 100):
             supabase.table('staging_clients').insert(staging_data[i:i+100]).execute()
-    except Exception as e:
-        errors.append(f"Staging Error: {e}")
+    except Exception as e: errors.append(f"Staging Error: {e}")
 
-    # 5. SYNC PORTFOLIO (Only works if we found a PAN)
+    # 7. SYNC PORTFOLIO (Net Calculation + NAV)
     portfolio_df = df[df['scheme'].notna() & df['pan'].notna()].copy()
     
     if not portfolio_df.empty:
         portfolio_df['signed_units'] = portfolio_df.apply(
             lambda x: -x['units'] if x['action'] == 'DEDUCT' else x['units'], axis=1
         )
+        
+        # Group by PAN + Scheme
         aggregated = portfolio_df.groupby(['pan', 'scheme'])['signed_units'].sum().reset_index()
         
         progress = st.progress(0)
-        total_groups = len(aggregated)
+        total = len(aggregated)
         
         for i, (idx, row) in enumerate(aggregated.iterrows()):
             pan = row['pan']
@@ -176,17 +211,33 @@ def sync_to_db(data):
             net_change = row['signed_units']
             
             try:
-                res = supabase.table('portfolio_snapshot').select('total_units')\
-                    .eq('pan', pan).eq('scheme_name', scheme).execute()
-                current = float(res.data[0]['total_units']) if res.data else 0.0
+                # Fetch existing units (unless we just reset them)
+                current_units = 0.0
+                if not is_reset_mode:
+                    res = supabase.table('portfolio_snapshot').select('total_units')\
+                        .eq('pan', pan).eq('scheme_name', scheme).execute()
+                    current_units = float(res.data[0]['total_units']) if res.data else 0.0
                 
+                final_units = current_units + net_change
+                
+                # NAV Calculation
+                nav = nav_map.get(scheme, 0.0) # Default to 0 if not found
+                current_value = round(final_units * nav, 2)
+
+                # Upsert Final Snapshot
                 supabase.table('portfolio_snapshot').upsert({
-                    'pan': pan, 'scheme_name': scheme, 'total_units': round(current + net_change, 4)
+                    'pan': pan, 
+                    'scheme_name': scheme, 
+                    'total_units': round(final_units, 4),
+                    'current_value': current_value,
+                    'nav': nav,
+                    'updated_at': datetime.now().isoformat()
                 }, on_conflict='pan,scheme_name').execute()
+                
             except Exception as e:
                 errors.append(f"Portfolio Error {pan}: {e}")
             
-            if i % 10 == 0: progress.progress((i + 1) / total_groups)
+            if i % 10 == 0: progress.progress((i + 1) / total)
         progress.empty()
 
     return len(data), errors
@@ -198,13 +249,16 @@ pwd_input = st.text_input("Zip Passwords", type="password")
 
 if st.button("🚀 Process & Sync"):
     if files:
-        with st.spinner("Processing..."):
-            results = process_rta_files(files, pwd_input)
-            if results:
-                s, err_list = sync_to_db(results)
+        with st.spinner("Processing & Calculating..."):
+            data, is_reset = process_rta_files(files, pwd_input)
+            
+            if data:
+                s, err_list = sync_to_db(data, is_reset)
                 st.success(f"✅ Processed {s} transactions!")
+                if is_reset: st.warning("🔄 Lifetime Reset was active for this batch.")
+                
                 if err_list:
-                    with st.expander("⚠️ View Errors"):
+                    with st.expander("⚠️ View Logs"):
                         for e in err_list: st.write(e)
             else:
                 st.warning("No data found.")
