@@ -1,4 +1,4 @@
-import os
+﻿import os
 import requests
 import re
 from datetime import datetime
@@ -8,8 +8,8 @@ from supabase import create_client
 print("🚀 Starting Ultimate NAV Engine...")
 
 # GITHUB SECRETS
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_URL = os.environ.get("https://lzkmnkwomccqsclvvqwp.supabase.co")
+SUPABASE_KEY = os.environ.get("sb_secret_Pv7eZ34CislDThQvu_sF-A_r1ZeNAWD")
 AMFI_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
