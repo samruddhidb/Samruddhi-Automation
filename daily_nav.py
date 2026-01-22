@@ -1,112 +1,88 @@
 ﻿import os
 import requests
-import re
-from datetime import datetime
+import toml
+import pathlib
 from supabase import create_client
+from datetime import datetime
 
-# --- DEBUG CONFIG ---
-print("🚀 Starting Ultimate NAV Engine...")
-
-# GITHUB SECRETS
+# --- 1. SMART CREDENTIAL LOADER ---
+# Priority A: Check Cloud Environment (GitHub Actions / Streamlit Cloud)
 SUPABASE_URL = os.environ.get("https://lzkmnkwomccqsclvvqwp.supabase.co")
 SUPABASE_KEY = os.environ.get("sb_secret_Pv7eZ34CislDThQvu_sF-A_r1ZeNAWD")
-AMFI_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
 
+# Priority B: Check Local File (Your Laptop)
+if not SUPABASE_URL:
+    try:
+        # Find the .streamlit/secrets.toml file relative to this script
+        script_dir = pathlib.Path(__file__).parent.absolute()
+        secrets_path = script_dir / ".streamlit" / "secrets.toml"
+        
+        if secrets_path.exists():
+            print(f"🔍 Found local secrets at: {secrets_path}")
+            data = toml.load(secrets_path)
+            SUPABASE_URL = data["supabase"]["url"]
+            SUPABASE_KEY = data["supabase"]["key"]
+            print("✅ Loaded Cloud credentials from local file.")
+    except Exception as e:
+        print(f"⚠️ Could not read local secrets: {e}")
+
+# Check if we found them
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ ERROR: Secrets missing.")
+    print("❌ FATAL ERROR: No API Keys found!")
+    print("   - Local: Check .streamlit/secrets.toml")
+    print("   - Deployed: Check GitHub Repository Secrets")
     exit(1)
 
+# --- 2. THE NAV ENGINE ---
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 🧠 LOGIC: GENERATE CLEAN ID
-def generate_clean_id(scheme_name):
-    # Replaces non-alphanumeric with "_" and uppercases
-    return re.sub(r'[^a-zA-Z0-9]', '_', scheme_name).upper()
+print("🚀 Starting NAV Engine...")
+try:
+    # Fetch schemes specifically from the 'watched_schemes' table
+    response = supabase.table('watched_schemes').select('scheme_name').execute()
+    schemes = [item['scheme_name'] for item in response.data]
+except Exception as e:
+    print(f"❌ Database Connect Error: {e}")
+    exit(1)
 
-def run_engine():
-    # 1. GET RADAR (Schemes we watch)
-    print("📡 Fetching Watchlist...")
-    radar = supabase.table('watched_schemes').select('scheme_code').execute()
-    radar_codes = {r['scheme_code'] for r in radar.data}
+if not schemes:
+    print("⚠️ No schemes found in 'watched_schemes' table.")
+    exit()
 
-    if not radar_codes:
-        print("ℹ️ No schemes to watch.")
-        return
+print(f"🔄 Updating {len(schemes)} schemes...")
+updated_count = 0
 
-    print(f"🌍 Downloading AMFI Data for {len(radar_codes)} schemes...")
-    
+for scheme in schemes:
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(AMFI_URL, stream=True, timeout=30, headers=headers)
+        # 1. Search MFAPI for the Scheme Code
+        search_url = f"https://api.mfapi.in/mf/search?q={scheme}"
+        search_res = requests.get(search_url).json()
         
-        updates = []
-        
-        for line in response.iter_lines():
-            if line:
-                try:
-                    decoded = line.decode('utf-8')
-                    parts = decoded.split(';')
-                    
-                    # AMFI FORMAT CHECK
-                    # 0: Code, 1: ISIN1, 2: ISIN2, 3: Name, 4: NAV, 5: Date
-                    if len(parts) >= 6:
-                        code = parts[0]
-                        
-                        # MATCHING LOGIC
-                        if code in radar_codes:
-                            isin1 = parts[1]
-                            isin2 = parts[2]
-                            name = parts[3]
-                            nav = float(parts[4])
-                            date_str = parts[5].strip()
-                            
-                            # Parse Date
-                            try:
-                                nav_date = datetime.strptime(date_str, "%d-%b-%Y").strftime("%Y-%m-%d")
-                            except:
-                                continue # Skip invalid dates
-
-                            # Add to batch
-                            updates.append({
-                                'scheme_code': code,
-                                'scheme_name': name,
-                                'isin1': isin1,
-                                'isin2': isin2,
-                                'current_nav': nav,
-                                'last_nav_date': nav_date
-                            })
-                except:
-                    continue
-
-        # 2. BATCH UPDATE
-        if updates:
-            print(f"💾 Updating {len(updates)} schemes...")
+        if search_res:
+            code = search_res[0]['schemeCode']
             
-            for u in updates:
-                # Update Radar (Now with ISINs!)
-                supabase.table('watched_schemes').update({
-                    'current_nav': u['current_nav'],
-                    'last_nav_date': u['last_nav_date'],
-                    'isin1': u['isin1'],
-                    'isin2': u['isin2']
-                }).eq('scheme_code', u['scheme_code']).execute()
+            # 2. Get Latest NAV
+            nav_url = f"https://api.mfapi.in/mf/{code}"
+            nav_data = requests.get(nav_url).json()
+            
+            if nav_data.get('data'):
+                current_nav = float(nav_data['data'][0]['nav'])
                 
-                # Cascade Update Snapshots
-                # Formula: Value = Units * New NAV
-                snaps = supabase.table('portfolio_snapshot').select('snapshot_id, total_units').eq('scheme_code', u['scheme_code']).execute()
-                for s in snaps.data:
-                    new_val = float(s['total_units']) * u['current_nav']
-                    supabase.table('portfolio_snapshot').update({
-                        'current_value': new_val,
-                        'nav_date': u['last_nav_date']
-                    }).eq('snapshot_id', s['snapshot_id']).execute()
-                    
-            print("✅ SUCCESS! Database updated.")
+                # 3. Save to DB
+                supabase.table('watched_schemes').upsert({
+                    'scheme_name': scheme,
+                    'nav': current_nav,
+                    'updated_at': datetime.now().isoformat()
+                }).execute()
+                
+                print(f"✅ {scheme}: {current_nav}")
+                updated_count += 1
+            else:
+                print(f"⚠️ No data found for {scheme}")
         else:
-            print("⚠️ No updates found matching your watchlist.")
-
+            print(f"⚠️ Could not find code for {scheme}")
+            
     except Exception as e:
-        print(f"❌ ERROR: {e}")
+        print(f"❌ Error updating {scheme}: {e}")
 
-if __name__ == "__main__":
-    run_engine()
+print(f"🎉 Done! Updated {updated_count}/{len(schemes)} schemes.")

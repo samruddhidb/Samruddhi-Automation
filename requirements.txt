@@ -2,3 +2,5 @@ streamlit
 pandas
 pyzipper
 supabase
+toml
+requests
