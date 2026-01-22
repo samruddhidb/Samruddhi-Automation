@@ -31,22 +31,15 @@ def clean_float(val):
         return 0.0
 
 def fetch_latest_navs(schemes):
-    """
-    Mock function to fetch NAVs. 
-    In production, replace this with an API call (e.g., MFAPI.in)
-    For now, we just check if we have a stored NAV in 'watched_schemes' or default to 10.0
-    """
     nav_map = {}
     try:
-        # Optimziation: Fetch only needed schemes if possible, or all watched
         response = supabase.table('watched_schemes').select('scheme_name, nav').execute()
         for item in response.data:
             nav_map[item['scheme_name']] = float(item['nav'])
-    except:
-        pass # specific error handling if needed
+    except: pass
     return nav_map
 
-# --- 🧠 LOGIC: FILE PARSER (Robust & Smart) ---
+# --- 🧠 LOGIC: FILE PARSER ---
 def process_rta_files(uploaded_files, passwords):
     all_data = []
     pwd_list = [p.strip() for p in passwords.split(",")] if passwords else [None]
@@ -56,16 +49,12 @@ def process_rta_files(uploaded_files, passwords):
         df = None
         success_read = False
         
-        # FAIL-SAFE CHECK: Is this a "Lifetime" April 2024 file?
-        # We check the filename or content date if possible. 
-        # For now, simple filename check or user flag is safest.
-        # Logic: If filename contains 'APR2024' or similar, trigger reset.
+        # Check for Lifetime Reset
         if "APR2024" in uploaded_file.name.upper() or "LIFETIME" in uploaded_file.name.upper():
             is_lifetime_reset = True
             st.toast(f"⚠️ LIFETIME RESET DETECTED in {uploaded_file.name}!", icon="🔥")
 
         try:
-            # 1. Handle ZIP / CSV
             if uploaded_file.name.endswith('.zip'):
                 for pwd in pwd_list:
                     try:
@@ -84,7 +73,6 @@ def process_rta_files(uploaded_files, passwords):
             else:
                 df = pd.read_csv(uploaded_file, on_bad_lines='skip', low_memory=False)
 
-            # 2. Extract Data
             if df is not None:
                 df.columns = [str(c).strip().replace("'", "").replace('"', "") for c in df.columns]
                 fname = uploaded_file.name.upper()
@@ -130,7 +118,6 @@ def process_rta_files(uploaded_files, passwords):
                             if any(x in nature for x in ['PURCHASE', 'S T P IN', 'SWITCH IN']): t['action'] = 'ADD'
                             elif any(x in nature for x in ['SHIFT OUT', 'REDEMPTION', 'SWITCH OUT']): t['action'] = 'DEDUCT'
 
-                        # Store valid rows
                         if t['name'] or t['pan']: all_data.append(t)
                     except: continue
 
@@ -138,45 +125,54 @@ def process_rta_files(uploaded_files, passwords):
 
     return all_data, is_lifetime_reset
 
-# --- 💾 LOGIC: THE INTELLIGENT SYNC ENGINE ---
+# --- 💾 LOGIC: TWO-PASS INTELLIGENT SYNC ---
 def sync_to_db(data, is_reset_mode):
     if not data: return 0, ["No data found"]
     
     errors = []
     
-    # 1. BRAIN BUILD: Fetch Name->PAN Map from DB
+    # --- PASS 1: BUILD THE BRAIN (Identify Everyone First) ---
+    # Fetch existing DB clients
     try:
         db_clients = supabase.table('clients').select('name, pan').execute()
+        # Start with what the DB knows
         name_map = {item['name'].strip().upper(): item['pan'] for item in db_clients.data if item['name'] and item['pan']}
     except: name_map = {}
 
-    # 2. NAV BUILD: Fetch latest NAVs
-    nav_map = fetch_latest_navs(set([d['scheme'] for d in data if d.get('scheme')]))
+    # Update map with NEW people found in this file (The Fix!)
+    for row in data:
+        if row['pan'] and row['name']:
+            clean_name = str(row['name']).strip().upper()
+            name_map[clean_name] = row['pan'] # Add new guy to memory immediately
 
+    # --- PASS 2: PROCESS TRANSACTIONS (Using the Updated Brain) ---
     df = pd.DataFrame(data)
 
-    # 3. SELF-HEALING: Fill missing PANs
+    # 1. Fill Missing PANs using the NOW COMPLETE name_map
     def fill_pan(row):
         if not row['pan'] and row['name']:
             return name_map.get(str(row['name']).strip().upper(), None)
         return row['pan']
     df['pan'] = df.apply(fill_pan, axis=1)
 
-    # 4. FAIL-SAFE RESET (The "April 2024" Logic)
+    # 2. SEPARATE STREAMS: Master Data vs Transaction Data
+    # Identify Master Rows (Have PAN/Name but NO Scheme info)
+    master_df = df[df['pan'].notna() & df['scheme'].isna()]
+    
+    # Identify Transaction Rows (Have Scheme info)
+    transaction_df = df[df['scheme'].notna()]
+
+    # 3. FAIL-SAFE RESET
     if is_reset_mode:
-        # Logic: If this is a lifetime file, we assume the units in this file 
-        # are the TOTAL holdings. We should overwrite, not add.
-        # For safety, we delete portfolio entries for the PANs found in this file.
         unique_reset_pans = df[df['pan'].notna()]['pan'].unique()
         if len(unique_reset_pans) > 0:
             try:
-                # Batch delete is safer
                 supabase.table('portfolio_snapshot').delete().in_('pan', list(unique_reset_pans)).execute()
                 errors.append(f"⚠️ RESET TRIGGERED: Cleared portfolio for {len(unique_reset_pans)} clients.")
-            except Exception as e:
-                errors.append(f"Reset Failed: {e}")
+            except Exception as e: errors.append(f"Reset Failed: {e}")
 
-    # 5. SYNC CLIENTS (Master Data)
+    # 4. SYNC CLIENTS (Only from Master Rows + valid Transaction rows)
+    # We grab unique clients from EVERYWHERE to ensure no one is missed
     unique_clients = df[['pan', 'name', 'email', 'phone']].drop_duplicates(subset=['pan'])
     for _, row in unique_clients.iterrows():
         if row['pan'] and row['name']:
@@ -184,23 +180,27 @@ def sync_to_db(data, is_reset_mode):
             try: supabase.table('clients').upsert(payload).execute()
             except: pass
 
-    # 6. SYNC STAGING (Raw Log - Always Insert)
+    # 5. SYNC STAGING (The "Raw Log")
+    # We still log everything here for safety, but now the PANs are filled!
     try:
         staging_data = df[['pan', 'name', 'email', 'phone', 'scheme', 'units', 'action']].where(pd.notnull(df), None).to_dict('records')
         for i in range(0, len(staging_data), 100):
             supabase.table('staging_clients').insert(staging_data[i:i+100]).execute()
     except Exception as e: errors.append(f"Staging Error: {e}")
 
-    # 7. SYNC PORTFOLIO (Net Calculation + NAV)
-    portfolio_df = df[df['scheme'].notna() & df['pan'].notna()].copy()
+    # 6. SYNC PORTFOLIO (Only from Transaction Rows with valid PANs)
+    # Filter: Must have Scheme AND PAN
+    valid_transactions = transaction_df[transaction_df['pan'].notna()].copy()
     
-    if not portfolio_df.empty:
-        portfolio_df['signed_units'] = portfolio_df.apply(
+    if not valid_transactions.empty:
+        # Get NAVs
+        nav_map = fetch_latest_navs(set(valid_transactions['scheme'].unique()))
+
+        valid_transactions['signed_units'] = valid_transactions.apply(
             lambda x: -x['units'] if x['action'] == 'DEDUCT' else x['units'], axis=1
         )
         
-        # Group by PAN + Scheme
-        aggregated = portfolio_df.groupby(['pan', 'scheme'])['signed_units'].sum().reset_index()
+        aggregated = valid_transactions.groupby(['pan', 'scheme'])['signed_units'].sum().reset_index()
         
         progress = st.progress(0)
         total = len(aggregated)
@@ -211,7 +211,6 @@ def sync_to_db(data, is_reset_mode):
             net_change = row['signed_units']
             
             try:
-                # Fetch existing units (unless we just reset them)
                 current_units = 0.0
                 if not is_reset_mode:
                     res = supabase.table('portfolio_snapshot').select('total_units')\
@@ -219,12 +218,9 @@ def sync_to_db(data, is_reset_mode):
                     current_units = float(res.data[0]['total_units']) if res.data else 0.0
                 
                 final_units = current_units + net_change
-                
-                # NAV Calculation
-                nav = nav_map.get(scheme, 0.0) # Default to 0 if not found
+                nav = nav_map.get(scheme, 0.0)
                 current_value = round(final_units * nav, 2)
 
-                # Upsert Final Snapshot
                 supabase.table('portfolio_snapshot').upsert({
                     'pan': pan, 
                     'scheme_name': scheme, 
@@ -234,8 +230,7 @@ def sync_to_db(data, is_reset_mode):
                     'updated_at': datetime.now().isoformat()
                 }, on_conflict='pan,scheme_name').execute()
                 
-            except Exception as e:
-                errors.append(f"Portfolio Error {pan}: {e}")
+            except Exception as e: errors.append(f"Portfolio Error {pan}: {e}")
             
             if i % 10 == 0: progress.progress((i + 1) / total)
         progress.empty()
